@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""
+ScriptCat Manager — import, list, remove, backup, restore, update userscripts
+from Brave's ScriptCat extension via LevelDB.
+"""
+import argparse, json, os, re, sys, time, uuid, urllib.request, socket
+
+PLYVEL_AVAILABLE = False
+try:
+    import plyvel
+    PLYVEL_AVAILABLE = True
+except ImportError:
+    pass
+
+BRAVE_EXT_ID = "ndcooeababalnlpkfedmmbbbgkljhpjf"
+COMPILED_NS = "57d79c56-231a-42d3-b6e3-d2004ba0866f"
+
+def get_db_path():
+    p = os.path.expanduser(f"~/.config/BraveSoftware/Brave-Browser/Default/Local Extension Settings/{BRAVE_EXT_ID}")
+    if not os.path.isdir(p):
+        for base in ["~/.config/BraveSoftware/Brave-Browser-Beta", "~/.config/brave"]:
+            p2 = os.path.expanduser(f"{base}/Default/Local Extension Settings/{BRAVE_EXT_ID}")
+            if os.path.isdir(p2):
+                return p2
+    return p
+
+def ensure_plyvel():
+    if not PLYVEL_AVAILABLE:
+        print("error: plyvel not installed. Run: sudo pacman -S python-plyvel", file=sys.stderr)
+        sys.exit(1)
+
+def kill_brave():
+    os.system("pkill -f brave 2>/dev/null; sleep 1")
+    lock = os.path.join(get_db_path(), "LOCK")
+    if os.path.exists(lock):
+        try: os.remove(lock)
+        except: pass
+
+def open_db():
+    ensure_plyvel()
+    db_path = get_db_path()
+    kill_brave()
+    return plyvel.DB(db_path, create_if_missing=True)
+
+GLOBAL_TIMEOUT = socket._GLOBAL_DEFAULT_TIMEOUT
+
+def fetch(url, timeout=15):
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
+    )
+    return urllib.request.urlopen(req, timeout=timeout).read().decode('utf-8')
+
+def parse_userscript(code):
+    m = re.search(r'@name\s+(.+?)(?:\n|$)', code)
+    name = m.group(1).strip() if m else "unnamed"
+    metadata = {}
+    for m in re.finditer(r'//\s*@(\w+)\s+(.+)', code):
+        k, v = m.group(1).lower(), m.group(2).strip()
+        metadata.setdefault(k, []).append(v)
+    match_urls = metadata.get('match', ["*://*.reddit.com/*"])
+    run_at = metadata.get('run-at', ['document-idle'])[0]
+    noframes = 'noframes' in metadata
+    return name, code, metadata, match_urls, run_at, noframes
+
+def write_script(db, sid, ts, name, code, metadata, match_urls, run_at, noframes):
+    version = metadata.get('version', ['1.0'])[0]
+    author = metadata.get('author', [''])[0]
+    download_url = metadata.get('downloadurl', [''])[0] if metadata.get('downloadurl') else ''
+    update_url = (metadata.get('updateurl', [''])[0] if metadata.get('updateurl')
+                  else download_url.replace('.user.js', '.meta.js') if download_url else '')
+
+    db.put(f"script:{sid}".encode(), json.dumps({
+        "author": author, "checkUpdate": bool(download_url),
+        "checkUpdateUrl": update_url, "checktime": ts, "createtime": ts,
+        "downloadUrl": download_url,
+        "metadata": {k: v for k, v in metadata.items()},
+        "name": name, "namespace": metadata.get('namespace', [''])[0],
+        "origin": download_url,
+        "originDomain": download_url.split('/')[2] if download_url else '',
+        "runStatus": "complete", "selfMetadata": {}, "sort": -1,
+        "status": 1, "type": 1, "updatetime": ts, "uuid": sid
+    }, ensure_ascii=False, separators=(',',':')).encode())
+
+    db.put(f"scriptCode:{sid}".encode(), json.dumps({
+        "code": code, "uuid": sid
+    }, separators=(',',':')).encode())
+
+    config = {
+        "allFrames": not noframes, "excludeGlobs": [], "excludeMatches": [],
+        "flag": f"#{sid}", "includeGlobs": [], "matches": match_urls,
+        "name": name, "originalUrlPatterns": None,
+        "require": metadata.get('require', []), "runAt": run_at,
+        "scriptUrlPatterns": [], "uuid": sid, "version": version, "world": "MAIN"
+    }
+    for u in match_urls:
+        scheme, host, path = ("*", "*", "*")
+        if "://" in u:
+            parts = u.split("://", 1)
+            scheme = parts[0]
+            rest = parts[1].split("/", 1)
+            host, path = rest[0], "/" + rest[1] if len(rest) > 1 else "/*"
+        config["scriptUrlPatterns"].append({
+            "patternString": u, "ruleContent": [scheme, host, path],
+            "ruleTag": "match", "ruleType": 1
+        })
+    db.put(f"compiled_resource:{COMPILED_NS}:{sid}".encode(),
+           json.dumps(config, separators=(',',':')).encode())
+
+    db.put(f"value:{sid}".encode(), json.dumps({
+        "createtime": ts, "data": {}, "storageName": sid,
+        "updatetime": ts, "uuid": sid
+    }, separators=(',',':')).encode())
+
+def delete_script(db, sid):
+    for prefix in ("script:", "scriptCode:", f"compiled_resource:{COMPILED_NS}:", "value:"):
+        db.delete(f"{prefix}{sid}".encode())
+
+def find_scripts(db, pattern):
+    matches = []
+    for key, value in db:
+        k = key.decode()
+        if k.startswith("script:"):
+            try:
+                d = json.loads(value)
+                if pattern.lower() in d.get('name', '').lower():
+                    matches.append(d)
+            except: pass
+    return matches
+
+def get_script_code(db, sid):
+    raw = db.get(f"scriptCode:{sid}".encode())
+    if raw:
+        try: return json.loads(raw).get('code', '')
+        except: pass
+    return ''
+
+# ── Commands ──────────────────────────────────────────────────────
+
+def cmd_install(args):
+    if args.url:
+        cmd_import_url(args)
+    else:
+        cmd_import(args)
+
+def cmd_import(args):
+    code = open(args.file).read()
+    name, *_ = parse_userscript(code)
+    db = open_db()
+    try:
+        sid = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        write_script(db, sid, ts, name, code, *parse_userscript(code)[2:])
+        db.close()
+        print(f"ok — installed \"{name}\"")
+    except Exception as e:
+        db.close()
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_import_url(args):
+    print(f"fetching {args.url}...")
+    code = fetch(args.url)
+    name, *_ = parse_userscript(code)
+    db = open_db()
+    try:
+        sid = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        write_script(db, sid, ts, name, code, *parse_userscript(code)[2:])
+        db.close()
+        print(f"ok — installed \"{name}\"")
+    except Exception as e:
+        db.close()
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_list(args):
+    ensure_plyvel()
+    db_path = get_db_path()
+    if not os.path.isdir(db_path):
+        print("No scripts installed.")
+        return
+    kill_brave()
+    try:
+        db = plyvel.DB(db_path, create_if_missing=False)
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    rows = []
+    for key, value in db:
+        k = key.decode()
+        if k.startswith("script:"):
+            try:
+                d = json.loads(value)
+                ver = d.get('metadata', {}).get('version', [''])[0]
+                update = d.get('downloadUrl', '')
+                rows.append((d.get('name', '?'), d.get('uuid', '?'), ver, bool(update)))
+            except: pass
+    db.close()
+    if not rows:
+        print("No scripts installed.")
+        return
+    print(f"{'Name':30s} {'Version':12s} {'Updates':7s}")
+    print("-" * 50)
+    for name, sid, ver, has_up in rows:
+        print(f"{name[:29]:30s} {ver[:11]:12s} {'yes' if has_up else 'no':7s}")
+    print(f"\n{len(rows)} script(s) installed")
+
+def cmd_remove(args):
+    db = open_db()
+    try:
+        matches = find_scripts(db, args.name)
+        if not matches:
+            print(f"no scripts matching \"{args.name}\"")
+            db.close()
+            return
+        names = []
+        for d in matches:
+            delete_script(db, d['uuid'])
+            names.append(d.get('name', '?'))
+        db.close()
+        print(f"ok — removed: {', '.join(names)}")
+    except Exception as e:
+        db.close()
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_update(args):
+    db = open_db()
+    try:
+        pattern = getattr(args, 'name', None) or ''
+        matches = find_scripts(db, pattern) if pattern else [json.loads(v) for k, v in db if k.decode().startswith("script:")]
+        if not matches:
+            print("No scripts to update.")
+            db.close()
+            return
+        ts = int(time.time() * 1000)
+        updated = 0
+        skipped = 0
+        errored = 0
+        for d in matches:
+            sid = d['uuid']
+            name = d.get('name', '?')
+            dl_url = d.get('downloadUrl', '')
+            if not dl_url:
+                print(f"  — {name}: no download URL, skipping")
+                skipped += 1
+                continue
+            try:
+                print(f"  ↓ {name}: fetching {dl_url}...", end=' ', flush=True)
+                new_code = fetch(dl_url)
+                new_name, _, metadata, match_urls, run_at, noframes = parse_userscript(new_code)
+                delete_script(db, sid)
+                write_script(db, sid, ts, new_name, new_code, metadata, match_urls, run_at, noframes)
+                print("updated")
+                updated += 1
+            except Exception as e:
+                print(f"error: {e}")
+                errored += 1
+        db.close()
+        print(f"\nok — {updated} updated, {skipped} skipped, {errored} errored")
+    except Exception as e:
+        db.close()
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_backup(args):
+    ensure_plyvel()
+    db_path = get_db_path()
+    if not os.path.isdir(db_path):
+        print("No scripts to backup.")
+        return
+    kill_brave()
+    try:
+        db = plyvel.DB(db_path, create_if_missing=False)
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    out = os.path.abspath(args.dir)
+    os.makedirs(out, exist_ok=True)
+    count = 0
+    for key, value in db:
+        k = key.decode()
+        if k.startswith("scriptCode:"):
+            try:
+                d = json.loads(value)
+                code = d.get('code', '')
+                sid = d.get('uuid', '')
+                name_bytes = db.get(f"script:{sid}".encode())
+                name = sid
+                if name_bytes:
+                    try:
+                        nd = json.loads(name_bytes)
+                        name = nd.get('name', sid)
+                    except: pass
+                safe = re.sub(r'[^\w\s-]', '', name).strip().replace(' ', '-')
+                with open(os.path.join(out, f"{safe}.user.js"), 'w') as f:
+                    f.write(code)
+                count += 1
+            except: pass
+    db.close()
+    print(f"ok — backed up {count} script(s) to {out}")
+
+def cmd_restore(args):
+    indir = os.path.abspath(args.dir)
+    if not os.path.isdir(indir):
+        print(f"error: {indir} not found", file=sys.stderr)
+        sys.exit(1)
+    files = sorted(f for f in os.listdir(indir) if f.endswith('.user.js'))
+    if not files:
+        print("no .user.js files found")
+        return
+    db = open_db()
+    try:
+        ts = int(time.time() * 1000)
+        count = 0
+        for fname in files:
+            code = open(os.path.join(indir, fname)).read()
+            name, _, metadata, match_urls, run_at, noframes = parse_userscript(code)
+            sid = str(uuid.uuid4())
+            write_script(db, sid, ts, name, code, metadata, match_urls, run_at, noframes)
+            print(f"  restored: {name}")
+            count += 1
+        db.close()
+        print(f"\nok — restored {count} script(s)")
+    except Exception as e:
+        db.close()
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+# ── Main ──────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(prog="scriptcat-mgr", description="Manage ScriptCat userscripts")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # install / import
+    pi = sub.add_parser("install", aliases=["import"], help="Install a .user.js file or URL")
+    pi.add_argument("file", nargs="?", help="Path to .user.js file")
+    pi.add_argument("-u", "--url", help="URL to a .user.js file")
+
+    pu = sub.add_parser("import-url", help="Install from a URL (alias: install -u)")
+    pu.add_argument("url", help="URL to a .user.js file")
+
+    pl = sub.add_parser("list", aliases=["ls"], help="List installed scripts")
+
+    pr = sub.add_parser("remove", aliases=["rm", "delete"], help="Remove a script by name")
+    pr.add_argument("name", help="Script name (partial match)")
+
+    pup = sub.add_parser("update", aliases=["upgrade"], help="Update scripts from their download URLs")
+    pup.add_argument("name", nargs="?", help="Script name to update (omit for all)")
+
+    pb = sub.add_parser("backup", help="Backup all scripts to a directory")
+    pb.add_argument("dir", help="Output directory")
+
+    prs = sub.add_parser("restore", help="Restore scripts from a backup directory")
+    prs.add_argument("dir", help="Backup directory")
+
+    args = p.parse_args()
+
+    cmd = args.cmd
+    # Handle alias mapping
+    alias_map = {
+        "ls": "list", "import": "install", "rm": "remove",
+        "delete": "remove", "upgrade": "update"
+    }
+    cmd = alias_map.get(cmd, cmd)
+    if cmd == "install" and args.url:
+        cmd = "import_url"
+
+    globals()[f"cmd_{cmd}"](args)
+
+if __name__ == "__main__":
+    main()
