@@ -3,7 +3,7 @@
 Manage userscripts in Brave's ScriptCat extension.
 
 ## Tool
-`/home/snow/scripts/scriptcat-mgr`
+`$HOME/scripts/scriptcat-mgr`
 
 ## Dependencies
 - `python-plyvel` (installed via pacman)
